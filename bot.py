@@ -21,43 +21,43 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# 2. Lấy API Token & Key từ môi trường
+# 2. Lấy API Token & Key từ biến môi trường
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
 
-# Các model dự phòng
+# Danh sách model theo thứ tự ưu tiên (Tự động đổi nếu model chính 503)
 PRIMARY_MODEL = "gemini-2.5-flash"
-FALLBACK_MODELS = ["gemini-1.5-flash", "gemini-2.0-flash"]
+FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"]
 
 
 async def generate_content_with_fallback(prompt: str):
-    """Gửi yêu cầu tới Gemini, tự động chuyển model dự phòng nếu quá tải"""
+    """Gửi yêu cầu tới Gemini. Nếu model chính bị lỗi 503/quá tải, tự động thử model dự phòng."""
     models_to_try = [PRIMARY_MODEL] + FALLBACK_MODELS
     last_exception = None
 
     for model_name in models_to_try:
         try:
-            logging.info(f"Đang gọi model: {model_name}")
+            logging.info(f"Đang gọi Gemini model: {model_name}")
             response = ai_client.models.generate_content(
                 model=model_name, contents=prompt
             )
             return response
         except (ServerError, APIError) as e:
-            logging.warning(f"Model {model_name} gặp lỗi API: {e}. Đang thử model khác...")
+            logging.warning(f"Model {model_name} bị lỗi API ({e}). Đang chuyển model dự phòng...")
             last_exception = e
             await asyncio.sleep(1)
         except Exception as e:
-            logging.error(f"Lỗi hệ thống khi gọi {model_name}: {e}")
+            logging.error(f"Lỗi không xác định khi gọi {model_name}: {e}")
             last_exception = e
             break
 
     raise last_exception
 
 
-# --- HANDLERS ---
+# --- HANDLERS TƯƠNG TÁC BOT ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
@@ -110,11 +110,12 @@ async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT
     """
 
     try:
+        # Gọi Gemini thông qua hàm tự động chuyển model dự phòng
         response = await generate_content_with_fallback(prompt)
         raw_text = response.text or ""
         logging.info(f"AI Output Raw: {raw_text}")
 
-        # Dùng Regex lọc lấy chuỗi JSON
+        # Trích xuất chuỗi JSON bằng Regex
         json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         if not json_match:
             await summarize_text_with_ai(update, context, user_text)
@@ -154,8 +155,10 @@ async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT
 
     except Exception as e:
         logging.error(f"Lỗi khi xử lý tin nhắn: {e}", exc_info=True)
-        # Báo chi tiết lỗi trực tiếp ra Telegram để dễ theo dõi
-        await update.message.reply_text(f"❌ **Phát sinh lỗi:** `{str(e)}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"❌ Máy chủ AI tạm thời quá tải ({type(e).__name__}). Bạn vui lòng thử lại sau vài giây nhé!",
+            parse_mode="Markdown"
+        )
 
 
 async def summarize_text_with_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -166,7 +169,7 @@ async def summarize_text_with_ai(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"📝 **Tóm tắt nội dung:**\n\n{response.text}", parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Lỗi tóm tắt: {e}")
-        await update.message.reply_text(f"❌ Không thể tóm tắt: `{str(e)}`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Tạm thời không thể xử lý tóm tắt. Bạn vui lòng thử lại sau!", parse_mode="Markdown")
 
 
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -191,7 +194,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text(text=f"{query.message.text}\n\n💤 **[Đã hoãn lại 10 phút nữa sẽ nhắc lại]**")
 
 
-# --- WEB SERVER GIỮ APPS ACTIVE ---
+# --- WEB SERVER GIỮ SERVICE ACTIVE TRÊN RENDER ---
 
 async def handle_ping_web(request):
     return web.Response(text="Bot Web Service đang hoạt động 24/7!", status=200)
@@ -206,10 +209,10 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"🌐 Web server đã chạy trên cổng {port}")
+    logging.info(f"🌐 Web server đã khởi chạy trên cổng {port}")
 
 
-# --- MAIN ---
+# --- KHỞI CHẠY CHÍNH ---
 
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -218,9 +221,10 @@ async def main():
     app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_messages))
 
+    # Khởi chạy Web Server song song với Telegram Bot
     await start_web_server()
 
-    logging.info("🚀 Bot Web Service đã sẵn sàng!")
+    logging.info("🚀 Bot Web Service đã sẵn sàng nhận tin nhắn!")
     async with app:
         await app.start()
         await app.updater.start_polling()
