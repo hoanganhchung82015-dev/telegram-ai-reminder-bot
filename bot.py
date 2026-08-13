@@ -1,7 +1,8 @@
 import os
 import json
+import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import asyncio
 
@@ -11,7 +12,6 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 from google import genai
-from google.genai import types
 from google.genai.errors import ServerError, APIError
 from aiohttp import web
 
@@ -21,41 +21,36 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# 2. Biến môi trường
+# 2. Lấy API Token & Key từ môi trường
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
 
-# Danh sách các model theo thứ tự ưu tiên (nếu model đầu quá tải 503 sẽ tự động chuyển model tiếp theo)
+# Các model dự phòng
 PRIMARY_MODEL = "gemini-2.5-flash"
 FALLBACK_MODELS = ["gemini-1.5-flash", "gemini-2.0-flash"]
 
 
-async def generate_content_with_fallback(prompt: str, config=None):
-    """Hàm gọi Gemini AI có tự động chuyển model nếu gặp lỗi 503 quá tải"""
+async def generate_content_with_fallback(prompt: str):
+    """Gửi yêu cầu tới Gemini, tự động chuyển model dự phòng nếu quá tải"""
     models_to_try = [PRIMARY_MODEL] + FALLBACK_MODELS
     last_exception = None
 
     for model_name in models_to_try:
         try:
-            logging.info(f"Đang gọi Gemini với model: {model_name}")
-            if config:
-                response = ai_client.models.generate_content(
-                    model=model_name, contents=prompt, config=config
-                )
-            else:
-                response = ai_client.models.generate_content(
-                    model=model_name, contents=prompt
-                )
+            logging.info(f"Đang gọi model: {model_name}")
+            response = ai_client.models.generate_content(
+                model=model_name, contents=prompt
+            )
             return response
         except (ServerError, APIError) as e:
-            logging.warning(f"Model {model_name} bị lỗi ({e}). Đang thử model tiếp theo...")
+            logging.warning(f"Model {model_name} gặp lỗi API: {e}. Đang thử model khác...")
             last_exception = e
-            await asyncio.sleep(1)  # Đợi 1s trước khi thử lại
+            await asyncio.sleep(1)
         except Exception as e:
-            logging.error(f"Lỗi không xác định khi gọi {model_name}: {e}")
+            logging.error(f"Lỗi hệ thống khi gọi {model_name}: {e}")
             last_exception = e
             break
 
@@ -98,38 +93,44 @@ async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT
     current_time_str = now_vn.strftime("%Y-%m-%d %H:%M:%S")
 
     prompt = f"""
-    Hôm nay là: {current_time_str} (Múi giờ Việt Nam).
+    Thời gian hiện tại: {current_time_str} (Múi giờ Việt Nam - ICT).
     Phân tích câu nhắn của người dùng: "{user_text}"
-    
-    Hãy trả về duy nhất một chuỗi JSON chuẩn (không chứa thẻ markdown ```json) có cấu trúc:
+
+    Hãy trả về đúng 1 định dạng JSON (không kèm văn bản giải thích thêm) theo cấu trúc:
     {{
-        "is_reminder": true hoặc false,
+        "is_reminder": true,
         "datetime": "YYYY-MM-DD HH:MM:SS",
-        "task": "Nội dung nhắc nhở"
+        "task": "Nội dung công việc"
     }}
-    
-    Quy tắc tính time:
-    - Nếu câu nhắn bảo "5 phút nữa" và hiện tại là "{current_time_str}" -> Cộng thêm 5 phút.
-    - Nếu câu nhắn chỉ có giờ (vd "14:30"), lấy ngày hôm nay (hoặc ngày mai nếu giờ đó đã qua trong ngày).
+
+    Quy tắc:
+    - Nếu là yêu cầu nhắc nhở/đặt lịch: is_reminder = true.
+    - Nếu câu có dạng "X phút nữa", "Y giờ nữa", hãy cộng thêm số phút/giờ đó vào thời gian hiện tại {current_time_str}.
+    - Nếu không phải nhắc nhở: is_reminder = false.
     """
 
     try:
         response = await generate_content_with_fallback(prompt)
+        raw_text = response.text or ""
+        logging.info(f"AI Output Raw: {raw_text}")
 
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-        logging.info(f"AI Response Raw: {clean_text}")
+        # Dùng Regex lọc lấy chuỗi JSON
+        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if not json_match:
+            await summarize_text_with_ai(update, context, user_text)
+            return
 
-        data = json.loads(clean_text)
+        data = json.loads(json_match.group(0))
 
         if data.get("is_reminder") and data.get("datetime"):
             target_time_str = data["datetime"]
             task_content = data.get("task") or "Nhắc nhở công việc"
-            
+
             naive_dt = datetime.strptime(target_time_str, "%Y-%m-%d %H:%M:%S")
             target_time = TIMEZONE.localize(naive_dt)
 
             if target_time <= now_vn:
-                await update.message.reply_text("⚠️ Thời gian hẹn giờ đã qua. Bạn vui lòng chọn thời gian ở tương lai nhé!")
+                await update.message.reply_text("⚠️ Thời gian hẹn giờ đã qua. Bạn vui lòng chọn thời điểm trong tương lai nhé!")
                 return
 
             if context.job_queue:
@@ -142,18 +143,19 @@ async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT
 
                 await update.message.reply_text(
                     f"✅ **Đã hẹn giờ thành công!**\n\n"
-                    f"🕒 **Thời gian:** `{target_time.strftime('%H:%M ngày %d/%m/%Y')}`\n"
+                    f"🕒 **Thời gian:** `{target_time.strftime('%H:%M:%S ngày %d/%m/%Y')}`\n"
                     f"📌 **Nội dung:** {task_content}",
                     parse_mode="Markdown"
                 )
             else:
-                await update.message.reply_text("❌ Lỗi hệ thống JobQueue.")
+                await update.message.reply_text("❌ Hệ thống hẹn giờ (JobQueue) chưa khởi tạo thành công.")
         else:
             await summarize_text_with_ai(update, context, user_text)
 
     except Exception as e:
-        logging.error(f"LỖI CHI TIẾT TẠI BOT: {e}", exc_info=True)
-        await update.message.reply_text("❌ AI đang quá tải hoặc gặp sự cố tạm thời. Bạn vui lòng thử lại sau vài giây nhé!")
+        logging.error(f"Lỗi khi xử lý tin nhắn: {e}", exc_info=True)
+        # Báo chi tiết lỗi trực tiếp ra Telegram để dễ theo dõi
+        await update.message.reply_text(f"❌ **Phát sinh lỗi:** `{str(e)}`", parse_mode="Markdown")
 
 
 async def summarize_text_with_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -164,7 +166,7 @@ async def summarize_text_with_ai(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"📝 **Tóm tắt nội dung:**\n\n{response.text}", parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Lỗi tóm tắt: {e}")
-        await update.message.reply_text("❌ Có lỗi xảy ra khi tóm tắt văn bản.")
+        await update.message.reply_text(f"❌ Không thể tóm tắt: `{str(e)}`", parse_mode="Markdown")
 
 
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
