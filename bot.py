@@ -11,6 +11,8 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 from google import genai
+from google.genai import types
+from google.genai.errors import ServerError, APIError
 from aiohttp import web
 
 # 1. Cấu hình Logging
@@ -19,13 +21,46 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# 2. Lấy API Token & Key từ biến môi trường
+# 2. Biến môi trường
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# Khởi tạo Gemini Client & Múi giờ
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
+
+# Danh sách các model theo thứ tự ưu tiên (nếu model đầu quá tải 503 sẽ tự động chuyển model tiếp theo)
+PRIMARY_MODEL = "gemini-2.5-flash"
+FALLBACK_MODELS = ["gemini-1.5-flash", "gemini-2.0-flash"]
+
+
+async def generate_content_with_fallback(prompt: str, config=None):
+    """Hàm gọi Gemini AI có tự động chuyển model nếu gặp lỗi 503 quá tải"""
+    models_to_try = [PRIMARY_MODEL] + FALLBACK_MODELS
+    last_exception = None
+
+    for model_name in models_to_try:
+        try:
+            logging.info(f"Đang gọi Gemini với model: {model_name}")
+            if config:
+                response = ai_client.models.generate_content(
+                    model=model_name, contents=prompt, config=config
+                )
+            else:
+                response = ai_client.models.generate_content(
+                    model=model_name, contents=prompt
+                )
+            return response
+        except (ServerError, APIError) as e:
+            logging.warning(f"Model {model_name} bị lỗi ({e}). Đang thử model tiếp theo...")
+            last_exception = e
+            await asyncio.sleep(1)  # Đợi 1s trước khi thử lại
+        except Exception as e:
+            logging.error(f"Lỗi không xác định khi gọi {model_name}: {e}")
+            last_exception = e
+            break
+
+    raise last_exception
+
 
 # --- HANDLERS ---
 
@@ -37,6 +72,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. **Tóm tắt nội dung:** Paste văn bản hoặc ý tưởng dài vào đây để tôi tóm tắt giúp bạn."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
 
 async def send_reminder_notification(context: ContextTypes.DEFAULT_TYPE):
     job_data = context.job.data
@@ -55,6 +91,7 @@ async def send_reminder_notification(context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup,
         parse_mode="Markdown"
     )
+
 
 async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
     now_vn = datetime.now(TIMEZONE)
@@ -77,10 +114,7 @@ async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT
     """
 
     try:
-        response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
+        response = await generate_content_with_fallback(prompt)
 
         clean_text = response.text.replace("```json", "").replace("```", "").strip()
         logging.info(f"AI Response Raw: {clean_text}")
@@ -98,7 +132,6 @@ async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT
                 await update.message.reply_text("⚠️ Thời gian hẹn giờ đã qua. Bạn vui lòng chọn thời gian ở tương lai nhé!")
                 return
 
-            # Đặt job hẹn giờ
             if context.job_queue:
                 context.job_queue.run_once(
                     send_reminder_notification,
@@ -114,29 +147,29 @@ async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT
                     parse_mode="Markdown"
                 )
             else:
-                await update.message.reply_text("❌ Hệ thống JobQueue chưa sẵn sàng.")
+                await update.message.reply_text("❌ Lỗi hệ thống JobQueue.")
         else:
             await summarize_text_with_ai(update, context, user_text)
 
     except Exception as e:
-        logging.error(f"LỖI XỬ LÝ AI: {e}", exc_info=True)
-        await update.message.reply_text("❌ Không thể xử lý tin nhắn. Bạn vui lòng thử lại nhé!")
+        logging.error(f"LỖI CHI TIẾT TẠI BOT: {e}", exc_info=True)
+        await update.message.reply_text("❌ AI đang quá tải hoặc gặp sự cố tạm thời. Bạn vui lòng thử lại sau vài giây nhé!")
+
 
 async def summarize_text_with_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     prompt = f"Hãy tóm tắt ngắn gọn đoạn văn/nội dung sau thành các gạch đầu dòng súc tích:\n\n{text}"
     try:
-        response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
+        response = await generate_content_with_fallback(prompt)
         await update.message.reply_text(f"📝 **Tóm tắt nội dung:**\n\n{response.text}", parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Lỗi tóm tắt: {e}")
         await update.message.reply_text("❌ Có lỗi xảy ra khi tóm tắt văn bản.")
 
+
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_reminder_with_ai(update, context, update.message.text)
+
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -155,7 +188,8 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             )
         await query.edit_message_text(text=f"{query.message.text}\n\n💤 **[Đã hoãn lại 10 phút nữa sẽ nhắc lại]**")
 
-# --- WEB SERVER ---
+
+# --- WEB SERVER GIỮ APPS ACTIVE ---
 
 async def handle_ping_web(request):
     return web.Response(text="Bot Web Service đang hoạt động 24/7!", status=200)
@@ -172,10 +206,10 @@ async def start_web_server():
     await site.start()
     logging.info(f"🌐 Web server đã chạy trên cổng {port}")
 
+
 # --- MAIN ---
 
 async def main():
-    # Khai báo Application đầy đủ với JobQueue
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
