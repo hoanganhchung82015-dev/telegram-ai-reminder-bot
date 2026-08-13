@@ -34,7 +34,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "👋 **Chào bạn! Tôi là Trợ lý Thư ký AI.**\n\n"
         "Tôi có thể giúp bạn:\n"
-        "1. **Đặt lịch nhắc nhở:** Hãy nhắn tin tự nhiên như: *'Nhắc tôi 14:30 gửi bài báo cáo'*\n"
+        "1. **Đặt lịch nhắc nhở:** Hãy nhắn tin tự nhiên như: *'Nhắc tôi 14:30 gửi bài báo cáo'* hoặc *'Nhắc tôi 5 phút nữa đi uống nước'*\n"
         "2. **Tóm tắt nội dung:** Paste văn bản hoặc ý tưởng dài vào đây để tôi tóm tắt giúp bạn."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
@@ -58,39 +58,55 @@ async def send_reminder_notification(context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# Lập lịch đặt nhắc nhở bằng Gemini AI
+# Lập lịch đặt nhắc nhở bằng Gemini AI (Ép cấu trúc JSON Schema chuẩn)
 async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
     now_vn = datetime.now(TIMEZONE)
     current_time_str = now_vn.strftime("%Y-%m-%d %H:%M:%S")
 
     prompt = f"""
-    Hôm nay là: {current_time_str}.
-    Phân tích câu nhắn sau của người dùng: "{user_text}"
-    Trích xuất:
-    1. Thời gian nhắc nhở chính xác theo định dạng "YYYY-MM-DD HH:MM:SS". Nếu người dùng chỉ nói giờ (ví dụ 14:30), mặc định lấy ngày hôm nay (hoặc ngày mai nếu giờ đó đã trôi qua hôm nay).
-    2. Nội dung công việc cần nhắc.
-
-    Trả về kết quả duy nhất ở dạng JSON chuẩn với cấu trúc:
-    {{"is_reminder": true, "datetime": "YYYY-MM-DD HH:MM:SS", "task": "Nội dung công việc"}}
-    Nếu câu nhắn KHÔNG PHẢI là yêu cầu nhắc nhở, trả về:
-    {{"is_reminder": false}}
+    Hôm nay là: {current_time_str} (Múi giờ Việt Nam).
+    Phân tích câu nhắn của người dùng: "{user_text}"
+    
+    Yêu cầu:
+    1. Trích xuất thời gian nhắc nhở chính xác theo định dạng "YYYY-MM-DD HH:MM:SS".
+       - Ví dụ: Nếu người dùng nói "5 phút nữa" và giờ hiện tại là "2026-08-13 21:40:00" -> Thời gian tính ra là "2026-08-13 21:45:00".
+       - Nếu chỉ nói giờ (vd "14:30"), lấy ngày hôm nay (hoặc ngày mai nếu giờ đó đã qua trong ngày).
+    2. Nội dung công việc cần nhắc (task).
+    3. Đánh giá xem câu nhắn này có phải yêu cầu nhắc nhở hay không (is_reminder: true/false).
     """
 
+    # Cấu hình Ép Gemini trả về định dạng JSON Chuẩn (Structured JSON Schema)
+    json_schema = {
+        "type": "OBJECT",
+        "properties": {
+            "is_reminder": {"type": "BOOLEAN"},
+            "datetime": {"type": "STRING", "description": "YYYY-MM-DD HH:MM:SS"},
+            "task": {"type": "STRING"}
+        },
+        "required": ["is_reminder"]
+    }
+
     try:
+        # Gọi Gemini AI kèm response_mime_type="application/json"
         response = ai_client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=prompt
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": json_schema
+            }
         )
-        cleaned_json = response.text.strip().replace("```json", "").replace("```", "").strip()
-        data = json.loads(cleaned_json)
 
-        if data.get("is_reminder"):
+        data = json.loads(response.text)
+
+        if data.get("is_reminder") and data.get("datetime"):
             target_time_str = data["datetime"]
-            task_content = data["task"]
+            task_content = data.get("task", "Nhắc nhở công việc")
+            
             target_time = TIMEZONE.localize(datetime.strptime(target_time_str, "%Y-%m-%d %H:%M:%S"))
 
             if target_time <= now_vn:
-                await update.message.reply_text("⚠️ Thời gian hẹn giờ nằm trong quá khứ. Bạn vui lòng chọn lại thời gian nhé!")
+                await update.message.reply_text("⚠️ Thời gian hẹn giờ nằm trong quá khứ hoặc không hợp lệ. Bạn vui lòng thử lại nhé!")
                 return
 
             # Đặt job hẹn giờ trong Telegram JobQueue
@@ -108,11 +124,11 @@ async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT
                 parse_mode="Markdown"
             )
         else:
-            # Nếu không phải câu nhắc nhở -> Gọi AI tóm tắt văn bản
+            # Nếu không phải câu nhắc nhở -> Chuyển sang tóm tắt văn bản
             await summarize_text_with_ai(update, context, user_text)
 
     except Exception as e:
-        logging.error(f"Lỗi AI xử lý: {e}")
+        logging.error(f"Lỗi AI xử lý chi tiết: {e}")
         await update.message.reply_text("❌ Không thể xử lý tin nhắn. Bạn vui lòng thử lại nhé!")
 
 # Tóm tắt nội dung bằng Gemini
