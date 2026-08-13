@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]==20.8
 google-genai
 pytz
 aiohttp
+pydantic
