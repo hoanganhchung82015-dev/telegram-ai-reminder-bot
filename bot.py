@@ -1,9 +1,10 @@
 import os
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 import asyncio
+from pydantic import BaseModel, Field
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -28,6 +29,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
 
+
+# --- ĐỊNH NGHĨA PYDANTIC MODEL CHO GEMINI STRUCTURED OUTPUT ---
+class ReminderResponse(BaseModel):
+    is_reminder: bool = Field(description="True nếu đây là yêu cầu đặt lịch/nhắc nhở, False nếu là văn bản khác")
+    datetime_str: str = Field(default="", description="Thời gian nhắc nhở chính xác theo định dạng YYYY-MM-DD HH:MM:SS")
+    task: str = Field(default="", description="Nội dung công việc cần nhắc nhở")
+
+
 # --- CÁC HÀM XỬ LÝ TELEGRAM BOT ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -38,6 +47,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. **Tóm tắt nội dung:** Paste văn bản hoặc ý tưởng dài vào đây để tôi tóm tắt giúp bạn."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
 
 # Hàm gửi thông báo nhắc nhở khi đến giờ
 async def send_reminder_notification(context: ContextTypes.DEFAULT_TYPE):
@@ -58,6 +68,7 @@ async def send_reminder_notification(context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+
 # Lập lịch đặt nhắc nhở bằng Gemini AI
 async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
     now_vn = datetime.now(TIMEZONE)
@@ -68,72 +79,67 @@ async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT
     Phân tích câu nhắn của người dùng: "{user_text}"
     
     Yêu cầu:
-    1. Xác định xem đây có phải yêu cầu nhắc nhở hẹn giờ không (is_reminder: true/false).
+    1. Xác định xem câu nhắn có phải là yêu cầu hẹn giờ/nhắc nhở công việc hay không (is_reminder = true/false).
     2. Nếu là nhắc nhở, tính toán thời gian chính xác dạng "YYYY-MM-DD HH:MM:SS".
-       - Ví dụ: Nếu hiện tại là 2026-08-13 21:40:00 và người dùng nói "5 phút nữa" -> "2026-08-13 21:45:00".
-       - Nếu chỉ cho giờ (vd "14:30"), lấy ngày hôm nay hoặc ngày mai nếu giờ đó đã qua.
+       - Ví dụ: Hiện tại là "2026-08-13 21:40:00", người dùng bảo "5 phút nữa" -> datetime_str là "2026-08-13 21:45:00".
+       - Nếu người dùng cho giờ (vd "14:30"), lấy ngày hôm nay hoặc ngày mai nếu giờ đó đã qua trong ngày.
     3. Trích xuất nội dung công việc (task).
     """
 
-    # ĐỊNH NGHĨA SCHEMA CHUẨN DÙNG GOOGLE.GENAI.TYPES (Đã sửa lỗi crash)
-    response_schema = types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "is_reminder": types.Schema(type=types.Type.BOOLEAN),
-            "datetime": types.Schema(type=types.Type.STRING, description="Định dạng YYYY-MM-DD HH:MM:SS"),
-            "task": types.Schema(type=types.Type.STRING),
-        },
-        required=["is_reminder"]
-    )
-
     try:
+        # Gọi AI với Structured Output thông qua Pydantic Class
         response = ai_client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=response_schema
-            )
+                response_schema=ReminderResponse,
+            ),
         )
 
-        # In log để debug trên Render
-        logging.info(f"Gemini Raw Response: {response.text}")
+        logging.info(f"AI Raw Result: {response.text}")
+        
+        # Parse kết quả JSON
+        result_json = json.loads(response.text)
+        is_reminder = result_json.get("is_reminder", False)
+        target_time_str = result_json.get("datetime_str", "")
+        task_content = result_json.get("task") or "Nhắc nhở công việc"
 
-        data = json.loads(response.text)
+        if is_reminder and target_time_str:
+            try:
+                naive_dt = datetime.strptime(target_time_str, "%Y-%m-%d %H:%M:%S")
+                target_time = TIMEZONE.localize(naive_dt)
 
-        if data.get("is_reminder") and data.get("datetime"):
-            target_time_str = data["datetime"]
-            task_content = data.get("task") or "Nhắc nhở công việc"
-            
-            # Parse datetime và gán múi giờ
-            naive_dt = datetime.strptime(target_time_str, "%Y-%m-%d %H:%M:%S")
-            target_time = TIMEZONE.localize(naive_dt)
+                if target_time <= now_vn:
+                    await update.message.reply_text("⚠️ Thời gian hẹn giờ đã qua trong quá khứ. Vui lòng chọn thời điểm ở tương lai nhé!")
+                    return
 
-            if target_time <= now_vn:
-                await update.message.reply_text("⚠️ Thời gian hẹn giờ đã qua. Bạn vui lòng thử lại thời gian trong tương lai nhé!")
+                # Đặt lịch trong JobQueue
+                context.job_queue.run_once(
+                    send_reminder_notification,
+                    when=target_time,
+                    chat_id=update.effective_chat.id,
+                    data={"chat_id": update.effective_chat.id, "content": task_content}
+                )
+
+                await update.message.reply_text(
+                    f"✅ **Đã hẹn giờ thành công!**\n\n"
+                    f"🕒 **Thời gian:** `{target_time.strftime('%H:%M ngày %d/%m/%Y')}`\n"
+                    f"📌 **Nội dung:** {task_content}",
+                    parse_mode="Markdown"
+                )
                 return
 
-            # Đặt job hẹn giờ trong Telegram JobQueue
-            context.job_queue.run_once(
-                send_reminder_notification,
-                when=target_time,
-                chat_id=update.effective_chat.id,
-                data={"chat_id": update.effective_chat.id, "content": task_content}
-            )
+            except ValueError as ve:
+                logging.error(f"Lỗi parse ngày tháng từ AI: {ve}")
 
-            await update.message.reply_text(
-                f"✅ **Đã hẹn giờ thành công!**\n\n"
-                f"🕒 **Thời gian:** `{target_time.strftime('%H:%M ngày %d/%m/%Y')}`\n"
-                f"📌 **Nội dung:** {task_content}",
-                parse_mode="Markdown"
-            )
-        else:
-            # Nếu không phải câu nhắc nhở -> Tóm tắt văn bản
-            await summarize_text_with_ai(update, context, user_text)
+        # Nếu không phải câu nhắc nhở (hoặc parse ngày thất bại) -> Chuyển sang tóm tắt văn bản
+        await summarize_text_with_ai(update, context, user_text)
 
     except Exception as e:
         logging.error(f"Lỗi AI xử lý chi tiết: {e}", exc_info=True)
         await update.message.reply_text("❌ Không thể xử lý tin nhắn. Bạn vui lòng thử lại nhé!")
+
 
 # Tóm tắt nội dung bằng Gemini
 async def summarize_text_with_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -150,10 +156,12 @@ async def summarize_text_with_ai(update: Update, context: ContextTypes.DEFAULT_T
         logging.error(f"Lỗi tóm tắt văn bản: {e}")
         await update.message.reply_text("❌ Có lỗi xảy ra khi tóm tắt văn bản.")
 
+
 # Handle tin nhắn
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     await process_reminder_with_ai(update, context, user_text)
+
 
 # Callback button (Đã xong / Hoãn)
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -175,6 +183,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         )
         await query.edit_message_text(text=f"{query.message.text}\n\n💤 **[Đã hoãn lại 10 phút nữa sẽ nhắc lại]**")
 
+
 # --- WEB SERVER GIỮ BOT LIVING TRÊN RENDER ---
 
 async def handle_ping_web(request):
@@ -191,6 +200,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logging.info(f"🌐 Web server đã chạy trên cổng {port}")
+
 
 # --- MAIN ---
 
