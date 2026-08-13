@@ -3,6 +3,7 @@ import json
 import logging
 from datetime import datetime
 import pytz
+import asyncio
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -10,7 +11,7 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 from google import genai
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiohttp import web
 
 # 1. Cấu hình Logging
 logging.basicConfig(
@@ -18,16 +19,15 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# 2. Lấy API Token từ biến môi trường (Hoặc nhập trực tiếp để test trên máy)
+# 2. Lấy API Token & Key từ biến môi trường (Environment Variables trên Render)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "NHẬP_TELEGRAM_TOKEN_TẠI_ĐÂY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "NHẬP_GEMINI_KEY_TẠI_ĐÂY")
 
-# Khởi tạo Gemini Client & Scheduler
+# Khởi tạo Gemini Client & Múi giờ Việt Nam
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
-scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
-# --- CÁC HÀM XỬ LÝ (HANDLERS) ---
+# --- CÁC HÀM XỬ LÝ TELEGRAM BOT (HANDLERS) ---
 
 # Lệnh /start
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -35,11 +35,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 **Chào bạn! Tôi là Trợ lý Thư ký AI.**\n\n"
         "Tôi có thể giúp bạn:\n"
         "1. **Đặt lịch nhắc nhở:** Hãy nhắn tin tự nhiên như: *'Nhắc tôi 14:30 gửi bài báo cáo'*\n"
-        "2. **Tóm tắt nội dung/link:** Paste văn bản hoặc link bài báo vào đây để tôi tóm tắt."
+        "2. **Tóm tắt nội dung:** Paste văn bản hoặc ý tưởng dài vào đây để tôi tóm tắt giúp bạn."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
-# Hàm gửi thông báo khi đến giờ
+# Hàm gửi thông báo nhắc nhở khi đến giờ
 async def send_reminder_notification(context: ContextTypes.DEFAULT_TYPE):
     job_data = context.job.data
     chat_id = job_data["chat_id"]
@@ -58,7 +58,7 @@ async def send_reminder_notification(context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# Lập lịch đặt nhắc nhở qua AI
+# Lập lịch đặt nhắc nhở bằng Gemini AI
 async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
     now_vn = datetime.now(TIMEZONE)
     current_time_str = now_vn.strftime("%Y-%m-%d %H:%M:%S")
@@ -93,7 +93,7 @@ async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT
                 await update.message.reply_text("⚠️ Thời gian hẹn giờ nằm trong quá khứ. Bạn vui lòng chọn lại thời gian nhé!")
                 return
 
-            # Đặt job hẹn giờ
+            # Đặt job hẹn giờ trong Telegram JobQueue
             context.job_queue.run_once(
                 send_reminder_notification,
                 when=target_time,
@@ -108,14 +108,14 @@ async def process_reminder_with_ai(update: Update, context: ContextTypes.DEFAULT
                 parse_mode="Markdown"
             )
         else:
-            # Nếu không phải nhắc nhở -> Chuyển sang AI tóm tắt văn bản
+            # Nếu không phải câu nhắc nhở -> Gọi AI tóm tắt văn bản
             await summarize_text_with_ai(update, context, user_text)
 
     except Exception as e:
-        logging.error(f"Lỗi AI: {e}")
-        await update.message.reply_text("❌ Không thể xử lý tin nhắn. Bạn vui lòng thử lại câu lệnh khác nhé!")
+        logging.error(f"Lỗi AI xử lý: {e}")
+        await update.message.reply_text("❌ Không thể xử lý tin nhắn. Bạn vui lòng thử lại nhé!")
 
-# Tóm tắt nội dung văn bản
+# Tóm tắt nội dung bằng Gemini
 async def summarize_text_with_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     prompt = f"Hãy tóm tắt ngắn gọn đoạn văn/nội dung sau thành các gạch đầu dòng súc tích, dễ hiểu:\n\n{text}"
@@ -127,14 +127,14 @@ async def summarize_text_with_ai(update: Update, context: ContextTypes.DEFAULT_T
         )
         await update.message.reply_text(f"📝 **Tóm tắt nội dung:**\n\n{response.text}", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text("❌ Có lỗi khi tóm tắt văn bản.")
+        await update.message.reply_text("❌ Có lỗi xảy ra khi tóm tắt văn bản.")
 
-# Xử lý tất cả tin nhắn văn bản từ User
+# Xử lý toàn bộ tin nhắn văn bản
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     await process_reminder_with_ai(update, context, user_text)
 
-# Xử lý sự kiện khi bấm nút trên thông báo
+# Xử lý sự kiện khi bấm nút trên thông báo nhắc nhở
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -145,18 +145,40 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     elif query.data.startswith("snooze_10_"):
         content = query.data.replace("snooze_10_", "")
         
-        # Hoãn lại 10 phút
+        # Hoãn lại 10 phút (600 giây)
         context.job_queue.run_once(
             send_reminder_notification,
-            when=600, # 600 giây = 10 phút
+            when=600,
             chat_id=query.message.chat_id,
             data={"chat_id": query.message.chat_id, "content": content}
         )
         await query.edit_message_text(text=f"{query.message.text}\n\n💤 **[Đã hoãn lại 10 phút nữa sẽ nhắc lại]**")
 
-# --- MAIN ---
-if __name__ == '__main__':
-    # Khởi tạo App Bot
+
+# --- PHẦN WEB SERVER (GIỮ BOT THỨC TRÊN RENDER WEB SERVICE) ---
+
+async def handle_ping_web(request):
+    """Hàm phản hồi khi UptimeRobot hoặc Browser truy cập vào link Web Service"""
+    return web.Response(text="Bot Web Service đang hoạt động 24/7!", status=200)
+
+async def start_web_server():
+    """Khởi chạy Web Server bằng aiohttp trên PORT do Render cấp"""
+    web_app = web.Application()
+    web_app.router.add_get("/", handle_ping_web)
+    web_app.router.add_get("/health", handle_ping_web)
+
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"🌐 Web server đã lắng nghe trên cổng {port}")
+
+
+# --- HÀM MAIN CHẠY SONG SONG BOT & WEB SERVER ---
+
+async def main():
+    # 1. Khởi tạo Telegram Bot App
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Đăng ký Handlers
@@ -164,5 +186,19 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_messages))
 
-    print("🚀 Bot đang chạy...")
-    app.run_polling()
+    # 2. Bật Web Server
+    await start_web_server()
+
+    # 3. Chạy Bot Polling
+    logging.info("🚀 Bot Web Service đã sẵn sàng!")
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+        # Giữ loop chạy liên tục
+        await asyncio.Event().wait()
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot đã dừng!")
